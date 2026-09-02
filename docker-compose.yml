@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  db:
+    image: ankane/pgvector:v0.5.1
+    # Note: pgvector image doesn't include PostGIS by default, 
+    # we should use a PostGIS image and install pgvector, or vice-versa.
+    # Actually, timescale/timescaledb-ha:pg14-latest includes both postgis and pgvector.
+    # Or we can just use postgis/postgis:15-3.4 and install pgvector on init.
+    # Let's use ankane/pgvector which is based on postgres, and we can install postgis if needed.
+    # Wait, better yet, just use standard postgis image and add pgvector.
+    image: postgis/postgis:15-3.4
+    environment:
+      POSTGRES_USER: orca_user
+      POSTGRES_PASSWORD: orca_password
+      POSTGRES_DB: orca_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  postgres_data:

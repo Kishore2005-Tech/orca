@@ -1,0 +1,429 @@
+# ORCA Reasoning Framework
+
+This document defines the reasoning pipeline every ORCA query passes through, from raw user text to a final explained recommendation. It specifies, at each stage, what is **deterministic** (fixed code/rules, no LLM judgment), what is **LLM reasoning** (language-model judgment, always evidence-bounded), what **tool calls** occur, and what **scientific constraints** apply. It assumes the agents and contracts defined in `AGENT_ARCHITECTURE.md` and `AGENT_CONTRACTS.md`.
+
+**Governing invariant, stated up front:** ORCA must never emit a confident recommendation when required evidence is unavailable. Every stage below is designed so that a missing-evidence condition can only ever *downgrade* confidence or *block* output — never be silently bypassed by LLM fluency. This is enforced structurally in §10, not just as a guideline.
+
+---
+
+## 1. Pipeline Overview
+
+```
+┌──────────────┐
+│  User Query  │
+└──────┬───────┘
+       ▼
+┌──────────────────┐   deterministic + LLM classification
+│ Intent Detection  │
+└──────┬────────────┘
+       ▼
+┌────────────────────┐  LLM decomposition, deterministic validation
+│ Query Decomposition │
+└──────┬──────────────┘
+       ▼
+┌──────────────────┐   deterministic routing table
+│  Agent Selection  │
+└──────┬─────────────┘
+       ▼
+┌──────────────────┐   tool calls (parallel/sequential per dependency graph)
+│  Data Retrieval   │
+└──────┬─────────────┘
+       ▼
+┌──────────────────────┐  deterministic aggregation
+│  Evidence Collection  │
+└──────┬─────────────────┘
+       ▼
+┌───────────────────────────┐  LLM reasoning, scientific-constraint-bounded
+│ Scientific Interpretation │
+└──────┬──────────────────────┘
+       ▼
+┌────────────────────────┐  LLM synthesis across agents, deterministic merge rules
+│  Cross-Agent Reasoning  │
+└──────┬────────────────────┘
+       ▼
+┌───────────────────┐   deterministic contradiction detection + LLM characterization
+│ Conflict Detection │
+└──────┬──────────────┘
+       ▼
+┌──────────────┐   deterministic checks (Verification Agent, §7 of Contracts)
+│ Verification │
+└──────┬─────────┘
+       ▼
+┌────────────────────────┐  deterministic scoring function
+│ Confidence Estimation   │
+└──────┬────────────────────┘
+       ▼
+┌─────────────────┐   deterministic gate + LLM phrasing
+│ Recommendation   │
+└──────┬─────────────┘
+       ▼
+┌──────────────┐   LLM generation, deterministic citation binding
+│ Explanation  │
+└──────────────┘
+```
+
+Every arrow above is a structured handoff conforming to the Standard Response Envelope (`AGENT_CONTRACTS.md` §0) — no stage passes free text to the next stage as its primary payload.
+
+---
+
+## 2. Stage-by-Stage Definition
+
+### 2.1 User Query
+**Input:** raw user text + conversation context.
+**Deterministic:** input sanitization, length limits, language detection.
+**LLM reasoning:** none yet — this stage is capture only.
+**Tool calls:** none.
+**Output:** `{ request_id, user_query, conversation_context }` (matches Coordinator input schema).
+
+### 2.2 Intent Detection
+**Purpose:** classify what domain(s) and answer-type the query needs.
+**Deterministic:** keyword/entity pre-scan for high-stakes triggers (emergency language, regulatory terms, species names) that force a minimum agent set regardless of downstream classification (see §4 — safety-triggering language must never rely solely on LLM judgment).
+**LLM reasoning:** classify intent into one or more domain categories (`ocean`, `ecosystem`, `fisheries`, `safety`, `knowledge`) and an answer-type (`fact_lookup`, `forecast`, `advisory`, `comparison`, `explanation`).
+**Tool calls:** none (classification only; may use a lightweight classifier model, not a full agent invocation).
+**Output:** `{ domains: [...], answer_type, safety_trigger: boolean, forced_agents: [...] }`.
+**Scientific constraint:** none at this stage — purely linguistic.
+
+### 2.3 Query Decomposition
+**Purpose:** break a multi-part query into atomic sub-queries answerable by single agents.
+**Deterministic:** enforce that every sub-query maps to exactly one agent's documented scope (cross-checked against each agent's `ORCA_ERR_OUT_OF_SCOPE` boundary in the Contracts doc); reject decompositions that would require an agent to answer outside its forbidden-responsibilities boundary.
+**LLM reasoning:** propose the decomposition (which sub-questions exist, in what order they logically depend on each other).
+**Tool calls:** none.
+**Output:** `{ sub_queries: [{ text, target_agent, depends_on: [sub_query_id, ...] }] }`.
+
+### 2.4 Agent Selection
+**Purpose:** finalize which agents run, and build the dependency graph for execution.
+**Deterministic:** this stage is **fully deterministic**. Given `sub_queries[].target_agent` and `depends_on`, a fixed routing/dependency table (see `AGENT_ARCHITECTURE.md` § Orchestration) produces the execution graph. The LLM's proposed decomposition is a *suggestion*; the actual agent invocation list and order is computed by code, not generated by the LLM.
+**LLM reasoning:** none — explicitly excluded (see §4).
+**Tool calls:** none (graph construction only).
+**Output:** `{ execution_graph: DAG(agent_id, depends_on[]) }`.
+
+### 2.5 Data Retrieval
+**Purpose:** invoke agents per the execution graph.
+**Deterministic:** parallel dispatch of independent nodes, sequential dispatch of dependent nodes, per-agent timeout enforcement (`AGENT_CONTRACTS.md` per-agent `TIMEOUT`), fallback invocation on timeout/error.
+**LLM reasoning:** none at the orchestration level. Individual agents may use LLM reasoning *internally* (e.g., Knowledge/RAG Agent's synthesis), but that is scoped inside the agent's own contract, not this stage.
+**Tool calls:** every domain/service agent's tools as defined in `AGENT_CONTRACTS.md` (ocean model APIs, biodiversity databases, regulation registries, advisory feeds, geocoders, vector search).
+**Output:** `{ envelopes: [StandardResponseEnvelope, ...] }` — one per invoked agent.
+
+### 2.6 Evidence Collection
+**Purpose:** aggregate and deduplicate all `evidence[]` arrays from the returned envelopes into one evidence pool for downstream stages.
+**Deterministic:** this stage is **fully deterministic** — a merge/dedup function, no LLM involvement. Deduplication key: `(source, reference, observed_or_published_at)`.
+**LLM reasoning:** none.
+**Tool calls:** none.
+**Output:** `{ evidence_pool: [EvidenceItem, ...], evidence_by_agent: { agent_id: [...] } }`.
+**Evidence requirement gate:** if `evidence_pool` is empty for any agent whose `observations` are non-empty, that agent's observations are marked `unsupported` and excluded from later stages (see §6).
+
+### 2.7 Scientific Interpretation
+**Purpose:** turn raw structured observations into domain-meaningful statements (e.g., "SST is 1.8°C above the 10-year baseline for this week," "this bleaching alert level indicates significant coral stress").
+**Deterministic:** unit conversion/normalization; range validation against physical/biological plausibility bounds (§5); anomaly-threshold classification using fixed statistical rules (z-score bands), not LLM judgment.
+**LLM reasoning:** phrase the interpretation in domain-appropriate language, select which observations are most relevant to the user's actual question. The LLM may *describe* a threshold crossing but must not *invent* the threshold.
+**Tool calls:** none new — operates on Data Retrieval's output.
+**Output:** `{ interpretations: [{ agent_id, observation_ref, statement, scientific_basis }] }`.
+**Scientific constraint:** every `statement` must be traceable to one or more `observation_ref` + the fixed rule/threshold used — no interpretation may assert a scientific relationship (e.g., causality) not licensed by §5.
+
+### 2.8 Cross-Agent Reasoning
+**Purpose:** combine interpretations from multiple agents into a coherent multi-domain picture (e.g., relating Ocean Agent's marine heatwave detection to Ecosystem Agent's bleaching alert, without asserting causation).
+**Deterministic:** enforce the causal-language ban (Ecosystem Agent's `is_causal_claim` constant, §5); enforce that cross-agent statements only combine interpretations that share a resolved location/time overlap (checked via Geospatial Agent output, §8).
+**LLM reasoning:** identify which interpretations from different agents are relevant to each other and draft the combined narrative, using only correlation framing where causation is not established by cited evidence.
+**Tool calls:** none new.
+**Output:** `{ combined_statements: [{ statement, supporting_interpretations: [...], is_correlation_only: boolean }] }`.
+
+### 2.9 Conflict Detection
+**Purpose:** identify contradictions between agents' outputs (e.g., Fisheries Agent says a season is open, but a Safety Agent advisory implies a closure-triggering event).
+**Deterministic:** structural contradiction check — same variable/claim type, overlapping location/time, differing values beyond stated tolerance → flagged automatically. This check is code, not LLM judgment (see §4).
+**LLM reasoning:** characterize *why* a flagged conflict might exist (e.g., different data vintages vs. genuine scientific disagreement) to help the Coordinator apply the right resolution policy — this is explanatory only, it does not decide whether a conflict exists.
+**Tool calls:** none new.
+**Output:** `{ conflicts: [{ claim_a, claim_b, source_a, source_b, likely_cause, resolvable: boolean }] }`.
+
+### 2.10 Verification
+**Purpose:** run the Verification Agent contract (`AGENT_CONTRACTS.md` §7) against the full draft answer and all contributing envelopes.
+**Deterministic:** claim-to-evidence traceability check, confidence-label consistency check, causal-language check — all rule-based, not LLM-decided (see §4). Fails closed on internal error.
+**LLM reasoning:** claim extraction from the draft answer text (identifying discrete assertions to check) uses LLM parsing, but the pass/fail *verdict* on each extracted claim is deterministic once evidence linkage is checked.
+**Tool calls:** Verification Agent invocation.
+**Output:** `{ overall_verdict, claim_checks: [...], flags: [...] }`.
+
+### 2.11 Confidence Estimation
+**Purpose:** compute the final confidence level/score for the composed answer.
+**Deterministic:** this stage is **fully deterministic** (§4, §9) — `final_confidence.level` = minimum of all contributing agents' confidence levels, further downgraded by any Verification `fail`/`pass_with_caveats` result and by any unresolved conflict. No LLM vote or "gut sense" adjustment is permitted.
+**LLM reasoning:** none for the score itself; LLM may draft the human-readable `basis` string once the score/level are fixed.
+**Tool calls:** none.
+**Output:** `{ level, score, basis }`.
+
+### 2.12 Recommendation
+**Purpose:** decide what, if anything, ORCA tells the user to do (e.g., "conditions are safe for diving," "this catch is within season").
+**Deterministic:** the **evidence-sufficiency gate** (§10) runs here and is absolute — if minimum evidence/confidence thresholds for a recommendation-type response are not met, no recommendation is generated, regardless of how confident the LLM's language would otherwise sound.
+**LLM reasoning:** within a gate-approved recommendation, phrase the guidance appropriately, choose the most relevant framing for the user's stated activity.
+**Tool calls:** none new.
+**Output:** `{ recommendation: string | null, blocked_reason: string | null }`.
+
+### 2.13 Explanation
+**Purpose:** produce the final user-facing answer with reasoning and citations.
+**Deterministic:** citation binding — every claim sentence in the explanation must be programmatically linked to an `evidence_pool` entry before the response is finalized; unlinked sentences are rejected and either re-grounded or removed, not shipped.
+**LLM reasoning:** generate the natural-language explanation, weave together interpretations, confidence caveats, and (if present) the recommendation, in accessible language.
+**Tool calls:** none new.
+**Output:** matches Coordinator `OUTPUT SCHEMA` in `AGENT_CONTRACTS.md` §8.
+
+---
+
+## 3. Deterministic vs. LLM Reasoning Matrix
+
+| Stage | Deterministic | LLM Reasoning | Tool Calls |
+|---|---|---|---|
+| User Query | Sanitization, limits | — | — |
+| Intent Detection | Safety/regulatory trigger pre-scan | Domain + answer-type classification | — |
+| Query Decomposition | Scope validation against agent contracts | Sub-query proposal | — |
+| Agent Selection | **Full** — routing table + DAG construction | — (excluded) | — |
+| Data Retrieval | Dispatch order, timeouts, fallback | (internal to agents only) | All agent tool calls |
+| Evidence Collection | **Full** — merge/dedup | — | — |
+| Scientific Interpretation | Unit checks, threshold classification | Phrasing, relevance selection | — |
+| Cross-Agent Reasoning | Causal-language ban, location/time overlap check | Combining narratives, correlation framing | — |
+| Conflict Detection | **Full** — contradiction detection logic | Explaining likely cause | — |
+| Verification | **Full** — pass/fail verdict logic | Claim extraction (parsing only) | Verification Agent |
+| Confidence Estimation | **Full** — scoring function | Drafting `basis` text only | — |
+| Recommendation | **Full** — evidence-sufficiency gate | Phrasing within gate-approved bounds | — |
+| Explanation | Citation binding | Natural-language generation | — |
+
+Rows marked **Full** are stages where LLM output, if any, is advisory/cosmetic only and cannot change the outcome.
+
+---
+
+## 4. Decisions That Must NOT Be Left Entirely to an LLM
+
+These are hard boundaries, enforced in code, not prompt instructions:
+
+1. **Agent Selection / routing.** Which agents get invoked is computed from a fixed table keyed on classified intent + forced triggers, never generated freeform by the LLM per query. Rationale: an LLM routing error (e.g., skipping Safety Agent for a query that mentions rip currents obliquely) is a safety failure, not a quality-of-answer issue.
+2. **Safety-trigger detection.** The keyword/entity pre-scan in Intent Detection (§2.2) that forces Safety Agent invocation runs deterministically *before* LLM classification and cannot be overridden by the LLM's classification disagreeing.
+3. **Evidence sufficiency / the no-confident-recommendation gate.** Whether enough evidence exists to issue a Recommendation is a threshold check on structured fields (`confidence.score`, `evidence_pool` non-emptiness, `verification_verdict`), never an LLM judgment call about whether it "feels" confident enough. See §10.
+4. **Conflict detection (existence, not characterization).** Whether two claims contradict is computed by comparing structured values/ranges, not by asking an LLM whether two passages "seem to disagree." The LLM may explain a detected conflict; it may not be the sole detector.
+5. **Confidence scoring.** The numeric/level confidence output is a deterministic function of contributing agents' confidence and Verification's verdict — never an LLM self-reported confidence number.
+6. **Verification pass/fail verdicts.** Once a claim is matched (or not) to supporting evidence, pass/fail is rule-based. The LLM's role is limited to claim extraction (splitting text into checkable units), not judging sufficiency.
+7. **Causal-language enforcement.** The Ecosystem Agent's ban on asserting causation (`is_causal_claim` hard-coded `false`) and the Cross-Agent Reasoning stage's correlation-only framing are structural constraints the LLM cannot relax by generating fluent causal-sounding prose — output is checked and, if it violates this, rejected/rewritten before release.
+8. **Regulatory/legal certification.** Fisheries Agent's `is_informational_only` constant means no stage may present output as legal compliance certification, regardless of how the LLM phrases it.
+9. **Jurisdiction and boundary resolution.** Spatial containment/jurisdiction facts come from the Geospatial Agent's boundary-dataset lookups, not from an LLM's geographic "knowledge," which may be stale or wrong (§8).
+10. **Citation binding in Explanation.** Every claim sentence must be programmatically matched to a real evidence entry before shipping; an LLM cannot introduce an unlinked "as we know" style assertion into the final answer.
+
+---
+
+## 5. Scientific Constraints
+
+Applied primarily during Scientific Interpretation (§2.7) and enforced again at Verification (§2.10):
+
+- **Physical plausibility bounds.** Each Ocean Agent variable has a hard-coded valid range (e.g., SST −2 to 40°C); values outside range are rejected as data errors, not reported as observations.
+- **Statistical thresholds are fixed, not LLM-chosen.** Anomaly classification (e.g., "marine heatwave") uses a predefined z-score/percentile threshold against a named baseline period — the LLM reports the classification, it does not decide the cutoff.
+- **Causal-language ban.** No agent or pipeline stage may assert that one observed phenomenon *caused* another unless the evidence itself is a study that establishes causation (in which case it's reported as "a cited study found," not as ORCA's own causal claim). Default framing for co-occurring events is correlation, explicitly labeled as such.
+- **Taxonomic precision.** Species/conservation-status terminology must match the source taxonomy's exact wording (e.g., IUCN category labels) — no informal substitution ("endangered" vs. "vulnerable" are not interchangeable).
+- **Regulatory exactness.** Regulation text is quoted/paraphrased only from the specific jurisdiction and effective-date-matched source; no extrapolation across jurisdictions or time gaps.
+- **Unit and reference-frame consistency.** All values normalized to defined units before comparison; depth, datum (e.g., tidal datum), and coordinate reference system must be explicit and consistent within any combined statement.
+
+---
+
+## 6. Evidence Requirements
+
+- Every `observations[]` item entering Scientific Interpretation must have at least one corresponding `evidence_pool` entry (§2.6 gate). Unsupported observations are excluded, not down-weighted-and-kept.
+- Cross-Agent Reasoning statements require evidence from **each** agent whose interpretation is being combined — a combined statement cannot rely on one agent's evidence to imply a claim about another agent's domain.
+- Verification's claim-to-evidence traceability check (§2.10) is the final backstop: any claim in the draft Explanation that lost its evidence linkage somewhere in the pipeline is caught here before release.
+- Minimum evidence count for a **Recommendation** (as opposed to a purely informational answer) is stricter than for general explanation — see §10.
+
+---
+
+## 7. Temporal Reasoning
+
+- **Freshness thresholds are per-agent and fixed** (`AGENT_CONTRACTS.md`): e.g., Ocean Agent observational data stale after 24h; Fisheries Agent regulation re-verification required every 30 days. These are deterministic checks, not LLM estimates of "how old is too old."
+- **Effective-date matching.** Fisheries Agent rules must have `effective_from <= date <= effective_to` for the queried date — no nearest-match fallback.
+- **Forecast vs. observation labeling.** Every temporal value carries `is_forecast`/`valid_at`; Explanation must never present a forecast as a current observation.
+- **Time zone and "as of" stamping.** All timestamps normalized to UTC internally; the Explanation stage converts to the user's local context only at final rendering, and always states the "as of" time of the underlying data, not just the response generation time.
+- **Advisory expiry.** Safety Agent advisories past `expires_at` are dropped from active observations at Evidence Collection time — a stale advisory can never reach Explanation framed as current.
+
+---
+
+## 8. Spatial Reasoning
+
+- **All location resolution flows through Geospatial Agent** — no other agent or pipeline stage resolves place names, coordinates, or jurisdiction independently (`AGENT_ARCHITECTURE.md` §5 rationale).
+- **Ambiguity blocks, it doesn't guess.** If Geospatial Agent returns `is_ambiguous: true`, the pipeline halts that branch and either asks the user to disambiguate or — for safety-relevant queries — treats the request as unresolvable rather than picking the most likely candidate.
+- **Containment/jurisdiction ordering.** Jurisdiction and maritime-zone lookups always use the boundary dataset's stated vintage; if a location falls near a boundary within the dataset's margin of error, this is flagged as a warning rather than silently resolved to one side.
+- **Cross-agent spatial overlap check.** Cross-Agent Reasoning (§2.8) may only combine two agents' interpretations if their resolved locations overlap within a defined tolerance (e.g., same named region or within N km) — proximity is computed, not assumed by the LLM from context.
+
+---
+
+## 9. Uncertainty Handling
+
+- **Confidence never increases across stages, only holds or decreases.** Each stage from Data Retrieval onward propagates the minimum confidence seen so far; no combination of multiple `medium`-confidence sources is allowed to produce a `high`-confidence output — corroboration can raise a documented `score` slightly, but never the discrete `level` beyond the input minimum without new, stronger evidence added to the evidence pool.
+- **Verification downgrades, it does not upgrade.** A `pass_with_caveats` or `fail` verdict can only lower `final_confidence`, never raise it.
+- **Unresolved conflicts force `low` confidence** on the affected claim, regardless of individual agents' reported confidence, per the Conflict Handling policy in `AGENT_ARCHITECTURE.md`.
+- **Explicit "unknown" is a valid, preferred output.** When evidence is insufficient, the pipeline is designed to output `ORCA_ERR_NO_DATA`-derived caveats and a `low`/blocked result rather than let the LLM produce a plausible-sounding filler answer.
+
+---
+
+## 10. The No-Confident-Recommendation Invariant
+
+This is the single hardest gate in the pipeline, sitting at the entrance to Recommendation (§2.12). It is deterministic and cannot be satisfied by LLM fluency alone.
+
+**Gate conditions (ALL must hold for a Recommendation to be generated):**
+```
+allow_recommendation =
+      evidence_pool.length >= MIN_EVIDENCE_COUNT[answer_type]
+  AND all(item.traceable_to_evidence for item in verification.claim_checks)
+  AND verification.overall_verdict != "fail"
+  AND final_confidence.level != "low"
+  AND conflicts.filter(unresolved=true).length == 0
+  AND NOT any(agent.errors[].fatal for agent in contributing_envelopes if agent required for this recommendation)
+```
+
+**Pseudocode:**
+```
+function generate_recommendation(pipeline_state):
+    if not allow_recommendation(pipeline_state):
+        return {
+            recommendation: null,
+            blocked_reason: build_blocked_reason(pipeline_state),
+            # blocked_reason is deterministic text assembled from which
+            # condition failed -- NOT an LLM-authored excuse.
+        }
+
+    # Only once the gate passes does the LLM get invoked to phrase guidance,
+    # and even then it may only phrase claims already present in
+    # pipeline_state.interpretations / combined_statements -- it cannot
+    # introduce new assertions at this stage.
+    draft_text = llm_phrase_recommendation(
+        interpretations=pipeline_state.interpretations,
+        combined_statements=pipeline_state.combined_statements,
+        confidence=pipeline_state.final_confidence
+    )
+    bound_text = bind_citations(draft_text, pipeline_state.evidence_pool)
+    if bound_text.has_unbound_claims():
+        return {
+            recommendation: null,
+            blocked_reason: "generated guidance contained unsupported claims"
+        }
+    return { recommendation: bound_text, blocked_reason: null }
+```
+
+**Why this is structural, not a prompt instruction:** the gate function runs in code before the LLM is ever asked to phrase a recommendation. If the gate fails, the LLM recommendation-phrasing call never happens — there is no path by which a well-written LLM response can talk its way past insufficient evidence, because insufficient evidence means that call is never made.
+
+---
+
+## 11. Full Pipeline Pseudocode
+
+```
+function run_orca_pipeline(user_query, conversation_context):
+    q = capture(user_query, conversation_context)                      # 2.1
+
+    intent = detect_intent(q)                                          # 2.2 (det. pre-scan + LLM classify)
+
+    subqueries = decompose_query(q, intent)                            # 2.3 (LLM propose + det. validate)
+
+    graph = select_agents(subqueries, intent.forced_agents)            # 2.4 (fully deterministic)
+
+    envelopes = retrieve_data(graph)                                   # 2.5 (dispatch per graph, tool calls)
+
+    evidence_pool = collect_evidence(envelopes)                        # 2.6 (fully deterministic)
+
+    interpretations = interpret_scientifically(envelopes, evidence_pool)  # 2.7 (det. rules + LLM phrasing)
+
+    combined = cross_agent_reason(interpretations)                     # 2.8 (LLM synth + det. constraints)
+
+    conflicts = detect_conflicts(envelopes, combined)                  # 2.9 (fully deterministic detection)
+
+    verification = run_verification(envelopes, combined, conflicts)    # 2.10 (LLM extract + det. verdict)
+
+    confidence = estimate_confidence(envelopes, verification, conflicts)  # 2.11 (fully deterministic)
+
+    recommendation = generate_recommendation({                        # 2.12 (gated, see §10)
+        interpretations, combined, verification, confidence, conflicts, evidence_pool
+    })
+
+    final = generate_explanation(                                     # 2.13 (LLM gen + det. citation binding)
+        interpretations, combined, verification, confidence,
+        recommendation, evidence_pool
+    )
+
+    return final   # matches Coordinator OUTPUT SCHEMA, AGENT_CONTRACTS.md §8
+```
+
+---
+
+## 12. Supplementary Flow Diagrams
+
+### 12.1 Confidence propagation
+```
+ agent_1.confidence ─┐
+ agent_2.confidence ─┼─▶ min() ─▶ base_confidence
+ agent_n.confidence ─┘
+                                      │
+      verification.overall_verdict ──┼─▶ downgrade_if(fail | pass_with_caveats)
+                                      │
+        unresolved_conflicts.count ──┼─▶ force_low_if(> 0 on affected claim)
+                                      ▼
+                              final_confidence
+                        (never higher than base_confidence)
+```
+
+### 12.2 Recommendation gate
+```
+             ┌────────────────────────┐
+             │ evidence_pool sufficient?│─No─▶ blocked_reason: "insufficient evidence"
+             └───────────┬─────────────┘
+                        Yes
+                         ▼
+             ┌────────────────────────┐
+             │ all claims traceable?   │─No─▶ blocked_reason: "unsupported claim"
+             └───────────┬─────────────┘
+                        Yes
+                         ▼
+             ┌────────────────────────┐
+             │ verification != fail?   │─No─▶ blocked_reason: "verification failed"
+             └───────────┬─────────────┘
+                        Yes
+                         ▼
+             ┌────────────────────────┐
+             │ confidence != low?      │─No─▶ blocked_reason: "confidence too low"
+             └───────────┬─────────────┘
+                        Yes
+                         ▼
+             ┌────────────────────────┐
+             │ no unresolved conflicts?│─No─▶ blocked_reason: "unresolved conflict"
+             └───────────┬─────────────┘
+                        Yes
+                         ▼
+                LLM phrases recommendation
+                         ▼
+              bind citations, re-check
+                         ▼
+              ┌─────────────────────┐
+              │ all claims bound?    │─No─▶ blocked_reason: "unbound claim in output"
+              └───────────┬──────────┘
+                         Yes
+                          ▼
+                 Recommendation issued
+```
+
+### 12.3 Conflict-to-confidence path
+```
+ agent_A.claim ──┐
+                 ├─▶ structural compare ──▶ contradiction? ──Yes──▶ conflicts[]
+ agent_B.claim ──┘                                                     │
+                                                                        ▼
+                                                        Coordinator resolution policy
+                                                (recency/confidence → both-shown → cautious-default)
+                                                                        │
+                                                              resolved? ──No──▶ unresolved_conflicts[]
+                                                                        │                 │
+                                                                       Yes                 ▼
+                                                                        │        forces final_confidence = low
+                                                                        ▼
+                                                        proceeds with resolved claim only
+```
+
+---
+
+## 13. Summary Table: Where This Framework Prevents Overconfidence
+
+| Failure mode | Prevented by |
+|---|---|
+| LLM invents a plausible but unsourced fact | Citation binding (§2.13) rejects unlinked claims |
+| LLM smooths over a genuine data conflict | Deterministic conflict detection (§2.9) + Coordinator policy, not LLM discretion |
+| LLM reports high confidence from thin evidence | Deterministic confidence scoring (§2.11), min-propagation (§9) |
+| LLM issues advice despite missing data | Recommendation gate (§10) — hard block before generation |
+| LLM asserts causation from correlation | Causal-language ban enforced structurally (§5, §2.8) |
+| LLM misroutes a safety-relevant query | Deterministic safety pre-scan forces agent inclusion (§2.2, §4.2) |
+| LLM uses stale data as if current | Deterministic freshness/expiry checks (§7) |
+| LLM guesses an ambiguous location | Geospatial ambiguity halts the branch (§8) |
