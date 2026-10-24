@@ -2,7 +2,7 @@
 
 ORCA is an ocean intelligence platform that turns raw marine data (forecasts, buoy observations, satellite-derived layers) into **trustworthy, actionable advisories** for fishermen, coastal communities and marine researchers. A team of collaborating agents scores, cross-checks and explains each prediction, so users see not just *what* the model says but *how much to trust it*.
 
-**Live demo:** [orca-official.vercel.app](https://orca-official.vercel.app/)
+**Live demo: [orca-official.vercel.app](https://orca-official.vercel.app/)
 
 ---
 
