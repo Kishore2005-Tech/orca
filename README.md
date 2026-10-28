@@ -12,7 +12,7 @@ ORCA is an ocean intelligence platform that turns raw marine data (forecasts, bu
 |---|---|
 | **Advisory Reliability Score** | Compares forecasts against buoy observations to score how reliable an advisory is. |
 | **Causal Hypothesis Engine** | Proposes and ranks likely causes behind observed ocean conditions. |
-| **PFZ Scoring** | Scores Potential Fishing Zones from environmental signals. |
+| **PFZ Scoring | Scores Potential Fishing Zones from environmental signals. |
 | **Boat-Relative Safety Score | Converts sea state into a safety rating for a specific vessel. |
 | **IMBL Boundary-Crossing Risk | Estimates the risk of drifting or navigating across the International Maritime Boundary Line. |
 | **Anomaly Detection | Flags unusual readings in incoming ocean data. |
